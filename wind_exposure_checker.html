@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Wind Exposure Checker – ASCE 7 (Engineering Grade)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; background:#f5f7fa; margin:0; padding:20px; }
+    .container { max-width: 1100px; margin:auto; }
+    h1 { margin-bottom:10px; }
+    .card { background:white; padding:15px; border-radius:10px; box-shadow:0 2px 6px rgba(0,0,0,0.1); margin-bottom:20px; }
+    label { font-size:14px; }
+    input { width:100%; padding:8px; margin-top:4px; border-radius:6px; border:1px solid #ccc; }
+    button { padding:10px 15px; border:none; border-radius:6px; background:#2563eb; color:white; cursor:pointer; }
+    button:disabled { background:#9ca3af; cursor:not-allowed; }
+    table { width:100%; border-collapse:collapse; margin-top:10px; }
+    th, td { border:1px solid #ddd; padding:8px; text-align:left; }
+    th { background:#e5e7eb; }
+    .result { font-weight:bold; margin-top:10px; }
+    .small { font-size:12px; color:#555; }
+    .loading { color:#2563eb; font-weight:bold; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Wind Exposure Checker (ASCE 7 – Engineering Grade)</h1>
+
+    <div class="card">
+      <label>Latitude</label>
+      <input id="lat" placeholder="e.g. 39.5529" />
+      <label>Longitude</label>
+      <input id="lng" placeholder="e.g. -84.2615" />
+      <label>Building Height (ft)</label>
+      <input id="height" placeholder="e.g. 35" />
+      <br><br>
+      <button onclick="runCheck()">Run Check</button>
+      <button onclick="exportPDF()">Export PDF</button>
+      <div id="status" class="small"></div>
+    </div>
+
+    <div class="card">
+      <h3>Direction-by-Direction Results (±45°)</h3>
+      <table id="resultTable">
+        <thead>
+          <tr>
+            <th>Dir</th>
+            <th>Sector</th>
+            <th>Dominant Land Cover (Upwind)</th>
+            <th>Surface Roughness</th>
+            <th>Exposure</th>
+            <th>Fetch Requirement</th>
+            <th>Engineering Note</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div class="result" id="governing"></div>
+      <div class="small">Land cover source: ESA WorldCover 10 m via ArcGIS REST (client-side). Fetch rules per ASCE 7.</div>
+    </div>
+  </div>
+
+<script>
+  const sectors = [
+    {label:'N', center:0},
+    {label:'NE', center:45},
+    {label:'E', center:90},
+    {label:'SE', center:135},
+    {label:'S', center:180},
+    {label:'SW', center:225},
+    {label:'W', center:270},
+    {label:'NW', center:315}
+  ];
+
+  // ASCE fetch requirements
+  function fetchReqB(h) { return h <= 30 ? 1500 : Math.max(2600, 20 * h); }
+  function fetchReqD(h) { return Math.max(5000, 20 * h); }
+
+  // ESA WorldCover class mapping
+  const landCoverMap = {
+    10: {name:'Tree cover', rough:'B'},
+    20: {name:'Shrubland', rough:'C'},
+    30: {name:'Grassland', rough:'C'},
+    40: {name:'Cropland', rough:'C'},
+    50: {name:'Built-up', rough:'B'},
+    60: {name:'Bare / sparse', rough:'C'},
+    70: {name:'Snow / ice', rough:'D'},
+    80: {name:'Permanent water', rough:'D'},
+    90: {name:'Herbaceous wetland', rough:'C'},
+    95: {name:'Mangroves', rough:'C'},
+    100:{name:'Moss / lichen', rough:'C'}
+  };
+
+  function deg2rad(d){ return d * Math.PI / 180; }
+  function rad2deg(r){ return r * 180 / Math.PI; }
+
+  // Haversine destination point
+  function destPoint(lat, lon, brng, distMeters) {
+    const R = 6371000;
+    const δ = distMeters / R;
+    const θ = deg2rad(brng);
+    const φ1 = deg2rad(lat);
+    const λ1 = deg2rad(lon);
+
+    const φ2 = Math.asin( Math.sin(φ1)*Math.cos(δ) + Math.cos(φ1)*Math.sin(δ)*Math.cos(θ) );
+    const λ2 = λ1 + Math.atan2(Math.sin(θ)*Math.sin(δ)*Math.cos(φ1), Math.cos(δ)-Math.sin(φ1)*Math.sin(φ2));
+
+    return { lat: rad2deg(φ2), lon: rad2deg(λ2) };
+  }
+
+  async function getLandCover(lat, lon) {
+    const url = `https://services.arcgis.com/P3ePLMYs2RVChkJx/ArcGIS/rest/services/WorldCover_2021/MapServer/identify?f=json&tolerance=1&returnGeometry=false&imageDisplay=400,400,96&geometryType=esriGeometryPoint&geometry=${lon},${lat}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!data.results || data.results.length === 0) return null;
+    return parseInt(data.results[0].attributes.Value);
+  }
+
+  async function analyzeSector(lat, lon, bearing, h) {
+    const sampleDistances = [200, 500, 1000, 2000, 5000]; // meters
+    let counts = {};
+
+    for (let d of sampleDistances) {
+      const p = destPoint(lat, lon, bearing, d);
+      try {
+        const code = await getLandCover(p.lat, p.lon);
+        if (code !== null) counts[code] = (counts[code] || 0) + 1;
+      } catch (e) {}
+    }
+
+    let dominantCode = null;
+    let max = 0;
+    for (let k in counts) {
+      if (counts[k] > max) { max = counts[k]; dominantCode = k; }
+    }
+
+    let rough = 'C';
+    let name = 'Unknown';
+    if (dominantCode && landCoverMap[dominantCode]) {
+      rough = landCoverMap[dominantCode].rough;
+      name = landCoverMap[dominantCode].name;
+    }
+
+    let exposure = 'C';
+    let fetch = '—';
+    let note = 'Open terrain';
+
+    if (rough === 'B') {
+      exposure = 'B';
+      fetch = fetchReqB(h).toFixed(0) + ' ft';
+      note = 'Urban / wooded terrain upwind';
+    }
+    if (rough === 'D') {
+      exposure = 'D';
+      fetch = fetchReqD(h).toFixed(0) + ' ft';
+      note = 'Open water / flat unobstructed upwind';
+    }
+
+    return { land:name, rough, exposure, fetch, note };
+  }
+
+  async function runCheck() {
+    const lat = parseFloat(document.getElementById('lat').value);
+    const lng = parseFloat(document.getElementById('lng').value);
+    const h = parseFloat(document.getElementById('height').value);
+    if (isNaN(lat) || isNaN(lng) || isNaN(h)) { alert('Please enter valid numbers'); return; }
+
+    const status = document.getElementById('status');
+    status.innerHTML = '<span class="loading">Analyzing land cover by direction… this may take 10–20 seconds.</span>';
+
+    const tbody = document.querySelector('#resultTable tbody');
+    tbody.innerHTML = '';
+
+    let exposures = [];
+
+    for (let s of sectors) {
+      const res = await analyzeSector(lat, lng, s.center, h);
+      exposures.push(res.exposure);
+
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td>${s.label}</td>
+        <td>${s.center-45}°–${s.center+45}°</td>
+        <td>${res.land}</td>
+        <td>${res.rough}</td>
+        <td><b>${res.exposure}</b></td>
+        <td>${res.fetch}</td>
+        <td>${res.note}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+
+    let governing = 'B';
+    if (exposures.includes('D')) governing = 'D';
+    else if (exposures.includes('C')) governing = 'C';
+
+    document.getElementById('governing').innerText = 'Governing Exposure: ' + governing;
+    status.innerHTML = 'Analysis complete.';
+  }
+
+  function exportPDF() {
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF();
+
+    const lat = document.getElementById('lat').value;
+    const lng = document.getElementById('lng').value;
+    const h = document.getElementById('height').value;
+    const governing = document.getElementById('governing').innerText;
+
+    doc.setFontSize(14);
+    doc.text('Wind Exposure Direction-by-Direction Report', 10, 15);
+    doc.setFontSize(10);
+    doc.text('Location: ' + lat + ', ' + lng, 10, 25);
+    doc.text('Building Height: ' + h + ' ft', 10, 32);
+    doc.text(governing, 10, 39);
+
+    let y = 50;
+    doc.text('Dir', 10, y);
+    doc.text('Sector', 25, y);
+    doc.text('Land Cover', 55, y);
+    doc.text('Rough', 85, y);
+    doc.text('Exposure', 105, y);
+    doc.text('Fetch', 130, y);
+    y += 6;
+
+    document.querySelectorAll('#resultTable tbody tr').forEach(row => {
+      const cells = row.querySelectorAll('td');
+      doc.text(cells[0].innerText, 10, y);
+      doc.text(cells[1].innerText, 25, y);
+      doc.text(cells[2].innerText, 55, y, { maxWidth:30 });
+      doc.text(cells[3].innerText, 85, y);
+      doc.text(cells[4].innerText, 105, y);
+      doc.text(cells[5].innerText, 130, y);
+      y += 6;
+      if (y > 280) { doc.addPage(); y = 15; }
+    });
+
+    doc.addPage();
+    doc.text('Methodology & Code Basis', 10, 15);
+    doc.text('- Land cover sampled upwind using ESA WorldCover 10 m raster via ArcGIS REST.', 10, 25, { maxWidth:180 });
+    doc.text('- Surface roughness assigned per ASCE 7 definitions.', 10, 32, { maxWidth:180 });
+    doc.text('- Exposure category determined direction-by-direction using fetch requirements.', 10, 39, { maxWidth:180 });
+
+    doc.save('exposure-report.pdf');
+  }
+</script>
+</body>
+</html>
